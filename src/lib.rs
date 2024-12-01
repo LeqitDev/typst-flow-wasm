@@ -13,10 +13,10 @@ use flate2::read::GzDecoder;
 use tar::Archive;
 // use parking_lot::RwLock;
 use typst::{
-    diag::{EcoString, FileResult},
+    diag::{EcoString, FileResult, Severity},
     foundations::{Bytes, Datetime},
     model::Document,
-    syntax::{package::PackageSpec, FileId, LinkedNode, Source, VirtualPath},
+    syntax::{package::PackageSpec, FileId, LinkedNode, Source, Span, VirtualPath},
     text::{Font, FontBook},
     utils::LazyHash,
     Library, World,
@@ -27,6 +27,121 @@ use wasm_bindgen_futures::spawn_local;
 
 mod fetch;
 mod file_entry;
+
+#[wasm_bindgen]
+#[derive(Clone)]
+pub struct JsSpan {
+    span: String,
+    file_path: String,
+    range: Vec<usize>,
+}
+
+#[wasm_bindgen]
+impl JsSpan {
+    fn from_span(span: Span, sources: HashMap<FileId, FileEntry>) -> Self {
+        if span.is_detached() {
+            Self {
+                span: format!("{:?}", span),
+                file_path: String::new(),
+                range: Vec::new(),
+            }
+        } else {
+            let file_id = span.id().expect("None detached span should have an id");
+
+            let entry = sources
+                .get(&file_id)
+                .expect("File should exist because it got compiled");
+
+            let range = entry
+                .source
+                .range(span)
+                .expect("Range should be valid because the span points to the file");
+
+            Self {
+                span: format!("{:?}", span),
+                file_path: file_id
+                    .vpath()
+                    .as_rootless_path()
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+                range: Vec::from([range.start, range.end]),
+            }
+        }
+    }
+
+    pub fn get_span(&self) -> String {
+        self.span.clone()
+    }
+
+    pub fn get_file_path(&self) -> String {
+        self.file_path.clone()
+    }
+
+    pub fn get_range(&self) -> Vec<usize> {
+        self.range.clone()
+    }
+}
+
+#[wasm_bindgen]
+pub struct CompileError {
+    severity: Severity,
+    message: String,
+    root: JsSpan,
+    hints: Vec<String>,
+    trace: Vec<JsSpan>,
+}
+
+#[wasm_bindgen]
+impl CompileError {
+    fn from_diag(err: typst::diag::SourceDiagnostic, sources: HashMap<FileId, FileEntry>) -> Self {
+        let severity = err.severity;
+        let message = err.message.to_string();
+
+        let hints = err.hints.iter().map(|hint| hint.to_string()).collect();
+
+        let span = err.span;
+
+        let root = JsSpan::from_span(span, sources.clone());
+
+        let trace = err
+            .trace
+            .iter()
+            .map(|span| JsSpan::from_span(span.span, sources.clone()))
+            .collect();
+
+        Self {
+            severity,
+            message,
+            root,
+            hints,
+            trace,
+        }
+    }
+
+    pub fn get_severity(&self) -> String {
+        match self.severity {
+            Severity::Error => "error".to_string(),
+            Severity::Warning => "warning".to_string(),
+        }
+    }
+
+    pub fn get_message(&self) -> String {
+        self.message.clone()
+    }
+
+    pub fn get_hints(&self) -> Vec<String> {
+        self.hints.clone()
+    }
+
+    pub fn get_root(&self) -> JsSpan {
+        self.root.clone()
+    }
+
+    pub fn get_trace(&self) -> Vec<JsSpan> {
+        self.trace.clone()
+    }
+}
 
 #[wasm_bindgen]
 pub struct SuiteCore {
@@ -195,6 +310,10 @@ impl CompletionWrapper {
 extern "C" {
     pub fn xml_get_sync(path: String) -> Vec<u8>;
 
+    pub fn logWasm(s: &str);
+
+    pub fn errorWasm(s: &str);
+
     // Use `js_namespace` here to bind `console.log(..)` instead of just
     // `log(..)`
     #[wasm_bindgen(js_namespace = console)]
@@ -283,31 +402,23 @@ impl SuiteCore {
         }
     }
 
-    pub fn compile(&mut self) -> Result<Vec<String>, JsValue> {
+    pub fn compile(&mut self) -> Result<Vec<String>, Vec<CompileError>> {
         match typst::compile(self).output {
             Ok(doc) => {
                 *self.last_doc.lock().unwrap() = Some(doc.clone());
                 Ok(doc.pages.iter().map(typst_svg::svg).collect())
             }
             Err(err) => {
-                let mut str = String::new();
+                let mut errs: Vec<CompileError> = Vec::new();
 
                 for diag in err {
-                    match diag.severity {
-                        typst::diag::Severity::Error => {
-                            str.push_str(format!("error ({:?}): ", diag.span).as_str());
-                            str.push_str(&diag.message);
-                            str.push_str(format!("{:?}", diag.trace).as_str());
-                        }
-                        typst::diag::Severity::Warning => {
-                            str.push_str(format!("warning ({:?}): ", diag.span).as_str());
-                            str.push_str(&diag.message);
-                        }
-                    }
-                    str.push_str("\n\n");
+                    errs.push(CompileError::from_diag(
+                        diag,
+                        self.sources.read().unwrap().clone(),
+                    ));
                 }
 
-                Err(JsValue::from_str(&str))
+                Err(errs)
             }
         }
     }
