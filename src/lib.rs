@@ -15,6 +15,7 @@ use tar::Archive;
 use typst::{
     diag::{EcoString, FileResult, Severity},
     foundations::{Bytes, Datetime},
+    layout::Abs,
     model::Document,
     syntax::{package::PackageSpec, FileId, LinkedNode, Source, Span, VirtualPath},
     text::{Font, FontBook},
@@ -402,11 +403,15 @@ impl SuiteCore {
         }
     }
 
-    pub fn compile(&mut self) -> Result<Vec<String>, Vec<CompileError>> {
+    pub fn compile(&mut self, single: bool) -> Result<Vec<String>, Vec<CompileError>> {
         match typst::compile(self).output {
             Ok(doc) => {
                 *self.last_doc.lock().unwrap() = Some(doc.clone());
-                Ok(doc.pages.iter().map(typst_svg::svg).collect())
+                if single {
+                    Ok(vec![typst_svg::svg_merged(&doc, Abs::cm(2.0))])
+                } else {
+                    Ok(doc.pages.iter().map(typst_svg::svg).collect())
+                }
             }
             Err(err) => {
                 let mut errs: Vec<CompileError> = Vec::new();
