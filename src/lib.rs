@@ -438,6 +438,23 @@ impl SuiteCore {
         Ok(())
     }
 
+    pub fn remove_file(&mut self, file: String) -> Result<(), JsValue> {
+        let id = FileId::new(None, VirtualPath::new(format!("/{}", file)));
+        self.sources.write().unwrap().remove(&id);
+
+        Ok(())
+    }
+
+    pub fn move_file(&mut self, old: String, new: String) -> Result<(), JsValue> {
+        let old_id = FileId::new(None, VirtualPath::new(format!("/{}", old)));
+        let new_id = FileId::new(None, VirtualPath::new(format!("/{}", new)));
+
+        let entry = self.sources.write().unwrap().remove(&old_id).unwrap();
+        self.sources.write().unwrap().insert(new_id, entry);
+
+        Ok(())
+    }
+
     pub fn imports(&self) -> Result<(), JsValue> {
         let res = analyze_import(
             self,
