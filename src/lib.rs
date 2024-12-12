@@ -353,6 +353,31 @@ impl SuiteCore {
         }
     }
 
+    pub fn get_files(&self) -> Vec<String> {
+        self.sources
+            .read()
+            .unwrap()
+            .keys()
+            .map(|id| id.vpath().as_rootless_path().to_str().unwrap().to_string())
+            .collect()
+    }
+
+    pub fn set_root(&mut self, root: String) -> Result<(), String> {
+        // test for valid path (path in sources)
+        if !self
+            .sources
+            .read()
+            .unwrap()
+            .keys()
+            .any(|id| id.vpath().as_rootless_path().to_str().unwrap() == root.as_str())
+        {
+            return Err("The provided root path is not valid.".to_string());
+        }
+
+        self.root = PathBuf::from(root);
+        Ok(())
+    }
+
     // implement packages https://packages.typst.org/preview/index.json
     pub fn autocomplete(
         &self,
@@ -360,8 +385,9 @@ impl SuiteCore {
         offset: usize,
     ) -> Result<Vec<CompletionWrapper>, JsValue> {
         let source = self
-            .source(FileId::new(None, VirtualPath::new(format!("/{}", file))))
-            .unwrap();
+            .source(FileId::new(None, VirtualPath::new(&file)))
+            .map_err(|e| JsValue::from_str(&format!("{:?}", e)))?;
+
         let doc = self.last_doc.lock().unwrap().clone();
 
         match typst_ide::autocomplete(self, doc.as_ref(), &source, offset, true) {
@@ -429,7 +455,7 @@ impl SuiteCore {
     }
 
     pub fn add_file(&mut self, file: String, text: String) -> Result<(), JsValue> {
-        let id = FileId::new(None, VirtualPath::new(format!("/{}", file)));
+        let id = FileId::new(None, VirtualPath::new(&file));
         self.sources
             .write()
             .unwrap()
@@ -439,15 +465,15 @@ impl SuiteCore {
     }
 
     pub fn remove_file(&mut self, file: String) -> Result<(), JsValue> {
-        let id = FileId::new(None, VirtualPath::new(format!("/{}", file)));
+        let id = FileId::new(None, VirtualPath::new(&file));
         self.sources.write().unwrap().remove(&id);
 
         Ok(())
     }
 
     pub fn move_file(&mut self, old: String, new: String) -> Result<(), JsValue> {
-        let old_id = FileId::new(None, VirtualPath::new(format!("/{}", old)));
-        let new_id = FileId::new(None, VirtualPath::new(format!("/{}", new)));
+        let old_id = FileId::new(None, VirtualPath::new(&old));
+        let new_id = FileId::new(None, VirtualPath::new(&new));
 
         let entry = self.sources.write().unwrap().remove(&old_id).unwrap();
         self.sources.write().unwrap().insert(new_id, entry);
@@ -471,7 +497,7 @@ impl SuiteCore {
         begin: usize,
         end: usize,
     ) -> Result<(), JsValue> {
-        let id = FileId::new(None, VirtualPath::new(format!("/{}", file)));
+        let id = FileId::new(None, VirtualPath::new(&file));
         let mut binding = self.sources.write().unwrap();
         let entry = binding
             .get_mut(&id)
@@ -540,7 +566,7 @@ impl World for SuiteCore {
     }
 
     fn main(&self) -> FileId {
-        FileId::new(None, VirtualPath::new("/main.typ"))
+        FileId::new(None, VirtualPath::new(&self.root))
     }
 
     fn source(&self, id: FileId) -> FileResult<Source> {
