@@ -1,9 +1,11 @@
 use std::{
     cell::{OnceCell, RefCell},
     collections::HashMap,
+    fmt::Display,
     io::Read,
     path::PathBuf,
     rc::Rc,
+    str::FromStr,
     sync::{Arc, Mutex, OnceLock, RwLock},
 };
 
@@ -17,7 +19,10 @@ use typst::{
     foundations::{Bytes, Datetime},
     layout::Abs,
     model::Document,
-    syntax::{package::PackageSpec, FileId, LinkedNode, Source, Span, VirtualPath},
+    syntax::{
+        package::{self, PackageSpec, PackageVersion},
+        FileId, LinkedNode, Source, Span, VirtualPath,
+    },
     text::{Font, FontBook},
     utils::LazyHash,
     Library, World,
@@ -160,30 +165,169 @@ pub struct SuiteCore {
 
     last_doc: Mutex<Option<Document>>,
 
-    packages: RwLock<Vec<PackageSpec>>,
+    packages: RwLock<Vec<PackageWrapper>>,
+
+    package_index: OnceLock<Vec<(PackageSpec, Option<EcoString>)>>,
 }
 
-struct TypstPackage {
+#[derive(Clone, Debug)]
+enum ExtendedPackageVersion {
+    Latest,
+    Version(PackageVersion),
+}
+
+impl ExtendedPackageVersion {
+    fn from_str(version: &str) -> Result<Self, String> {
+        if version == "latest" {
+            Ok(Self::Latest)
+        } else {
+            let version = PackageVersion::from_str(version).map_err(|e| e.to_string())?;
+            Ok(Self::Version(version))
+        }
+    }
+
+    fn version(&self) -> &PackageVersion {
+        match self {
+            Self::Latest => &PackageVersion {
+                major: 0,
+                minor: 0,
+                patch: 0,
+            },
+            Self::Version(v) => v,
+        }
+    }
+}
+
+impl From<PackageVersion> for ExtendedPackageVersion {
+    fn from(version: PackageVersion) -> Self {
+        Self::Version(version)
+    }
+}
+
+impl PartialEq for ExtendedPackageVersion {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Latest, Self::Latest) => true,
+            (Self::Version(v1), Self::Version(v2)) => v1 == v2,
+            _ => false,
+        }
+    }
+}
+
+#[wasm_bindgen]
+#[derive(Clone, Debug)]
+pub struct RawPackageSpec {
     namespace: String,
     name: String,
     version: String,
+    description: Option<String>,
+}
+
+#[wasm_bindgen]
+impl RawPackageSpec {
+    #[wasm_bindgen(constructor)]
+    pub fn new(
+        namespace: String,
+        name: String,
+        version: String,
+        description: Option<String>,
+    ) -> Self {
+        Self {
+            namespace,
+            name,
+            version,
+            description,
+        }
+    }
+}
+
+impl From<RawPackageSpec> for PackageWrapper {
+    fn from(spec: RawPackageSpec) -> Self {
+        Self {
+            namespace: EcoString::from(spec.namespace),
+            name: EcoString::from(spec.name),
+            version: ExtendedPackageVersion::from_str(spec.version.as_str()).unwrap(),
+            fetched: false,
+            description: spec.description.map(EcoString::from),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PackageWrapper {
+    namespace: EcoString,
+    name: EcoString,
+    version: ExtendedPackageVersion,
+    fetched: bool,
+    description: Option<EcoString>,
+}
+
+impl PackageWrapper {
+    fn to_string(&self) -> String {
+        format!(
+            "{}-{}-{}/{}",
+            self.namespace,
+            self.name,
+            match &self.version {
+                ExtendedPackageVersion::Latest => "latest".to_string(),
+                ExtendedPackageVersion::Version(v) => v.to_string(),
+            },
+            self.fetched
+        )
+    }
+}
+
+impl From<PackageSpec> for PackageWrapper {
+    fn from(spec: PackageSpec) -> Self {
+        Self {
+            namespace: spec.namespace,
+            name: spec.name,
+            version: ExtendedPackageVersion::from(spec.version),
+            fetched: false,
+            description: None,
+        }
+    }
+}
+
+impl From<PackageWrapper> for PackageSpec {
+    fn from(wrapper: PackageWrapper) -> Self {
+        Self {
+            namespace: wrapper.namespace,
+            name: wrapper.name,
+            version: *wrapper.version.version(),
+        }
+    }
 }
 
 trait TPFetchable {
     fn fetch(&self) -> HashMap<FileId, FileEntry>;
 }
 
-trait TPComparable {
-    fn compare(&self, other: &Self) -> bool;
-}
-
 impl TPFetchable for PackageSpec {
     fn fetch(&self) -> HashMap<FileId, FileEntry> {
-        let path = format!(
-            "https://packages.typst.org/preview/{}-{}.tar.gz",
-            self.name, self.version
-        );
-        log(format!("fetching package: {}", path).as_str());
+        let path = {
+            if self.namespace().starts_with("wolframe-") {
+                let args = self.namespace().split("-").collect::<Vec<&str>>();
+                format!(
+                    "http://localhost:5173/packages/download?uname={}&pname={}",
+                    args[1..].join("-"),
+                    self.name()
+                )
+            } else {
+                format!(
+                    "https://packages.typst.org/preview/{}-{}.tar.gz",
+                    self.name, self.version
+                )
+            }
+        };
+        log(format!(
+            "fetching package: {}, {:?}, {}, {}",
+            path,
+            self,
+            self.namespace().starts_with("@wolframe-"),
+            self.namespace()
+        )
+        .as_str());
         let fetch = xml_get_sync(path);
         let cursor = std::io::Cursor::new(fetch);
         let gz_decoder = GzDecoder::new(cursor);
@@ -212,11 +356,57 @@ impl TPFetchable for PackageSpec {
     }
 }
 
-impl TPComparable for PackageSpec {
-    fn compare(&self, other: &Self) -> bool {
-        self.namespace == other.namespace
-            && self.name == other.name
-            && self.version == other.version
+trait UnifiedPackageSpec {
+    fn namespace(&self) -> &EcoString;
+    fn name(&self) -> &EcoString;
+    fn version(&self) -> &PackageVersion;
+}
+
+impl UnifiedPackageSpec for PackageSpec {
+    fn namespace(&self) -> &EcoString {
+        &self.namespace
+    }
+
+    fn name(&self) -> &EcoString {
+        &self.name
+    }
+
+    fn version(&self) -> &PackageVersion {
+        &self.version
+    }
+}
+
+impl UnifiedPackageSpec for PackageWrapper {
+    fn namespace(&self) -> &EcoString {
+        &self.namespace
+    }
+
+    fn name(&self) -> &EcoString {
+        &self.name
+    }
+
+    fn version(&self) -> &PackageVersion {
+        self.version.version()
+    }
+}
+
+trait TPComparable {
+    fn compare<R>(&self, other: &R) -> bool
+    where
+        R: UnifiedPackageSpec;
+}
+
+impl<T> TPComparable for T
+where
+    T: UnifiedPackageSpec,
+{
+    fn compare<R>(&self, other: &R) -> bool
+    where
+        R: UnifiedPackageSpec,
+    {
+        self.namespace() == other.namespace()
+            && self.name() == other.name()
+            && self.version() == other.version()
     }
 }
 
@@ -313,6 +503,9 @@ extern "C" {
 
     pub fn logWasm(s: &str);
 
+    #[wasm_bindgen(js_name = logWasm)]
+    pub fn log_wasm_any(s: Vec<String>);
+
     pub fn errorWasm(s: &str);
 
     // Use `js_namespace` here to bind `console.log(..)` instead of just
@@ -350,6 +543,7 @@ impl SuiteCore {
             root: PathBuf::from(root),
             last_doc: Mutex::new(None),
             packages: RwLock::new(Vec::new()),
+            package_index: OnceLock::default(),
         }
     }
 
@@ -378,6 +572,13 @@ impl SuiteCore {
         Ok(())
     }
 
+    pub fn add_packages(&mut self, packages: Vec<RawPackageSpec>) {
+        let mut lock = self.packages.write().unwrap();
+        for package in packages {
+            lock.push(package.into());
+        }
+    }
+
     // implement packages https://packages.typst.org/preview/index.json
     pub fn autocomplete(
         &self,
@@ -389,6 +590,15 @@ impl SuiteCore {
             .map_err(|e| JsValue::from_str(&format!("{:?}", e)))?;
 
         let doc = self.last_doc.lock().unwrap().clone();
+
+        log_wasm_any(
+            self.packages
+                .read()
+                .unwrap()
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<String>>(),
+        );
 
         match typst_ide::autocomplete(self, doc.as_ref(), &source, offset, true) {
             Some(completions) => Ok(completions.1.into_iter().map(|c| c.into()).collect()),
@@ -511,18 +721,51 @@ impl SuiteCore {
     fn get_file_entry(&self, id: FileId) -> FileResult<FileEntry> {
         // log(format!("accessing file entry: {:?}", id).as_str()); Debug
 
+        logWasm(
+            format!(
+                "accessing file entry: {:?}, package: {:?}",
+                id,
+                id.package()
+            )
+            .as_str(),
+        );
+
         match id.package() {
             Some(package) => {
-                if self
-                    .packages
-                    .read()
-                    .unwrap()
-                    .iter()
-                    .any(|p| package.compare(p))
+                let mut lock = self.packages.write().unwrap();
+                let int_package_opt: Option<&mut PackageWrapper> =
+                    lock.iter_mut().find(|p| package.compare(*p));
+
+                if int_package_opt.is_none() {
+                    return Err(typst::diag::FileError::NotFound(
+                        id.vpath().as_rootless_path().to_path_buf(),
+                    ));
+                }
+
+                let int_package = int_package_opt.unwrap();
+
+                if int_package.fetched
+                    && !(int_package.namespace().starts_with("wolframe-")
+                        && int_package.version
+                            == ExtendedPackageVersion::from_str("latest").unwrap())
                 {
+                    logWasm(
+                        format!(
+                            "package already fetched: {:?}, {}, {}, {}",
+                            id,
+                            int_package.namespace().starts_with("wolframe-"),
+                            (int_package.version
+                                == ExtendedPackageVersion::from_str("latest").unwrap()),
+                            !(int_package.namespace().starts_with("wolframe-")
+                                && (int_package.version
+                                    == ExtendedPackageVersion::from_str("latest").unwrap()))
+                        )
+                        .as_str(),
+                    );
                     let sources = self.sources.read().unwrap();
                     Ok(sources.get(&id).unwrap().clone())
                 } else {
+                    logWasm(format!("fetching package: {:?}", id).as_str());
                     /* let path = format!(
                         "https://raw.githubusercontent.com/typst/packages/refs/heads/main/packages/preview/{}/{}/{}",
                         id.package().unwrap().name,
@@ -536,7 +779,7 @@ impl SuiteCore {
                             writer.insert(*id, entry.clone());
                         }
                     }
-                    self.packages.write().unwrap().push(package.clone());
+                    int_package.fetched = true;
                     if fetched_sources.contains_key(&id) {
                         Ok(fetched_sources.get(&id).unwrap().clone())
                     } else {
@@ -597,6 +840,14 @@ impl World for SuiteCore {
     }
 
     // TODO: implement packages()
+    fn packages(&self) -> &[(PackageSpec, Option<EcoString>)] {
+        self.package_index.get_or_init(|| {
+            let lock = self.packages.read().unwrap();
+            lock.iter()
+                .map(|p| (p.clone().into(), p.description.clone()))
+                .collect()
+        })
+    }
 }
 
 impl SuiteCore {
