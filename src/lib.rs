@@ -309,7 +309,7 @@ impl TPFetchable for PackageSpec {
             if self.namespace().starts_with("wolframe-") {
                 let args = self.namespace().split("-").collect::<Vec<&str>>();
                 format!(
-                    "http://localhost:5173/packages/download?uname={}&pname={}",
+                    "/packages/download?uname={}&pname={}",
                     args[1..].join("-"),
                     self.name()
                 )
