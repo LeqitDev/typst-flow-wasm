@@ -67,7 +67,7 @@ impl JsSpan {
                 span: format!("{:?}", span),
                 file_path: file_id
                     .vpath()
-                    .as_rootless_path()
+                    .as_rooted_path()
                     .to_str()
                     .unwrap()
                     .to_string(),
