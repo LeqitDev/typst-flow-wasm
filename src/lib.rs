@@ -16,7 +16,7 @@ use tar::Archive;
 // use parking_lot::RwLock;
 use typst::{
     diag::{EcoString, FileResult, Severity},
-    foundations::{Bytes, Datetime},
+    foundations::{Bytes, Datetime, Value},
     layout::Abs,
     model::Document,
     syntax::{
@@ -27,7 +27,7 @@ use typst::{
     utils::LazyHash,
     Library, World,
 };
-use typst_ide::{analyze_import, Completion, CompletionKind};
+use typst_ide::{analyze_import, Completion, CompletionKind, Definition, DefinitionKind};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
@@ -71,6 +71,26 @@ impl JsSpan {
                     .to_str()
                     .unwrap()
                     .to_string(),
+                range: Vec::from([range.start, range.end]),
+            }
+        }
+    }
+
+    fn from_span_single(span: Span, source: &Source) -> Self {
+        if span.is_detached() {
+            Self {
+                span: format!("{:?}", span),
+                file_path: String::new(),
+                range: Vec::new(),
+            }
+        } else {
+            let range = source
+                .range(span)
+                .expect("Range should be valid because the span points to the file");
+
+            Self {
+                span: format!("{:?}", span),
+                file_path: source.id().vpath().as_rooted_path().to_str().unwrap().to_string(),
                 range: Vec::from([range.start, range.end]),
             }
         }
@@ -459,6 +479,97 @@ impl From<CompletionKind> for CompletionKindHighWrapper {
     }
 }
 
+#[derive(Clone)]
+#[wasm_bindgen(js_name = Value)]
+pub struct ValueWrapper(Value);
+
+#[wasm_bindgen(js_class = Value)]
+impl ValueWrapper {
+    pub fn name(&self) -> Option<String> {
+        self.0.name().map(|s| s.to_string())
+    }
+
+    pub fn docs(&self) -> Option<String> {
+        self.0.docs().map(|s| s.to_string())
+    }
+}
+
+impl From<Value> for ValueWrapper {
+    fn from(value: Value) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(Clone)]
+#[wasm_bindgen(js_name = DefinitionKind)]
+pub enum JsDefinitionKind {
+    Variable,
+    Function,
+    Module,
+    Label
+}
+
+impl From<DefinitionKind> for JsDefinitionKind {
+    fn from(kind: DefinitionKind) -> Self {
+        match kind {
+            DefinitionKind::Variable => JsDefinitionKind::Variable,
+            DefinitionKind::Function => JsDefinitionKind::Function,
+            DefinitionKind::Module => JsDefinitionKind::Module,
+            DefinitionKind::Label => JsDefinitionKind::Label,
+        }
+    }
+}
+
+#[wasm_bindgen]
+pub struct JsDefinition {
+    name: String,
+    span: JsSpan,
+    name_span: JsSpan,
+    kind: JsDefinitionKind,
+    value: Option<ValueWrapper>,
+}
+
+impl JsDefinition {
+    fn new(definition: Definition, source: &Source) -> Self {
+        let name = definition.name.to_string();
+        let span = JsSpan::from_span_single(definition.span, source);
+        let name_span = JsSpan::from_span_single(definition.name_span, source);
+        let kind = JsDefinitionKind::from(definition.kind);
+        let value = definition.value.map(ValueWrapper::from);
+
+        Self {
+            name,
+            span,
+            name_span,
+            kind,
+            value,
+        }
+    }
+}
+
+#[wasm_bindgen]
+impl JsDefinition {
+    pub fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    pub fn span(&self) -> JsSpan {
+        self.span.clone()
+    }
+
+    pub fn name_span(&self) -> JsSpan {
+        self.name_span.clone()
+    }
+
+    pub fn kind(&self) -> JsDefinitionKind {
+        self.kind.clone()
+    }
+
+    pub fn value(&self) -> Option<ValueWrapper> {
+        self.value.clone()
+    }
+}
+
 #[wasm_bindgen]
 pub struct CompletionWrapper {
     kind: CompletionKindHighWrapper,
@@ -591,19 +702,20 @@ impl SuiteCore {
 
         let doc = self.last_doc.lock().unwrap().clone();
 
-        log_wasm_any(
-            self.packages
-                .read()
-                .unwrap()
-                .iter()
-                .map(|p| p.to_string())
-                .collect::<Vec<String>>(),
-        );
-
         match typst_ide::autocomplete(self, doc.as_ref(), &source, offset, true) {
             Some(completions) => Ok(completions.1.into_iter().map(|c| c.into()).collect()),
             None => Ok(Vec::new()),
         }
+    }
+
+    pub fn definition(&self, file: String, offset: usize) -> Result<Option<JsDefinition>, JsValue> {
+        let source = self
+            .source(FileId::new(None, VirtualPath::new(&file)))
+            .map_err(|e| JsValue::from_str(&format!("{:?}", e)))?;
+
+        let doc = self.last_doc.lock().unwrap().clone();
+
+        Ok(typst_ide::definition(self, doc.as_ref(), &source, offset, typst::syntax::Side::After).map(|def| JsDefinition::new(def, &source)))
     }
 
     fn compile_str(&mut self, text: String) -> Result<String, JsValue> {
