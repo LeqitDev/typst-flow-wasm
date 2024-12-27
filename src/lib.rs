@@ -1,10 +1,7 @@
 use std::{
-    cell::{OnceCell, RefCell},
     collections::HashMap,
-    fmt::Display,
     io::Read,
     path::PathBuf,
-    rc::Rc,
     str::FromStr,
     sync::{Arc, Mutex, OnceLock, RwLock},
 };
@@ -12,162 +9,28 @@ use std::{
 use chrono::{DateTime, Datelike, Local};
 use file_entry::FileEntry;
 use flate2::read::GzDecoder;
+use js_types::RawPackageSpec;
 use tar::Archive;
 // use parking_lot::RwLock;
 use typst::{
-    diag::{EcoString, FileResult, Severity},
-    foundations::{Bytes, Datetime, Value},
+    diag::{EcoString, FileResult},
+    foundations::{Bytes, Datetime},
     layout::Abs,
     model::Document,
     syntax::{
-        package::{self, PackageSpec, PackageVersion},
-        FileId, LinkedNode, Source, Span, VirtualPath,
+        package::{PackageSpec, PackageVersion},
+        FileId, LinkedNode, Source, VirtualPath,
     },
     text::{Font, FontBook},
     utils::LazyHash,
     Library, World,
 };
-use typst_ide::{analyze_import, Completion, CompletionKind, Definition, DefinitionKind};
+use typst_ide::analyze_import;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen_futures::spawn_local;
 
 mod fetch;
 mod file_entry;
-
-#[wasm_bindgen]
-#[derive(Clone)]
-pub struct JsSpan {
-    span: String,
-    file_path: String,
-    range: Vec<usize>,
-}
-
-#[wasm_bindgen]
-impl JsSpan {
-    fn from_span(span: Span, sources: HashMap<FileId, FileEntry>) -> Self {
-        if span.is_detached() {
-            Self {
-                span: format!("{:?}", span),
-                file_path: String::new(),
-                range: Vec::new(),
-            }
-        } else {
-            let file_id = span.id().expect("None detached span should have an id");
-
-            let entry = sources
-                .get(&file_id)
-                .expect("File should exist because it got compiled");
-
-            let range = entry
-                .source
-                .range(span)
-                .expect("Range should be valid because the span points to the file");
-
-            Self {
-                span: format!("{:?}", span),
-                file_path: file_id
-                    .vpath()
-                    .as_rooted_path()
-                    .to_str()
-                    .unwrap()
-                    .to_string(),
-                range: Vec::from([range.start, range.end]),
-            }
-        }
-    }
-
-    fn from_span_single(span: Span, source: &Source) -> Self {
-        if span.is_detached() {
-            Self {
-                span: format!("{:?}", span),
-                file_path: String::new(),
-                range: Vec::new(),
-            }
-        } else {
-            let range = source
-                .range(span)
-                .expect("Range should be valid because the span points to the file");
-
-            Self {
-                span: format!("{:?}", span),
-                file_path: source.id().vpath().as_rooted_path().to_str().unwrap().to_string(),
-                range: Vec::from([range.start, range.end]),
-            }
-        }
-    }
-
-    pub fn get_span(&self) -> String {
-        self.span.clone()
-    }
-
-    pub fn get_file_path(&self) -> String {
-        self.file_path.clone()
-    }
-
-    pub fn get_range(&self) -> Vec<usize> {
-        self.range.clone()
-    }
-}
-
-#[wasm_bindgen]
-pub struct CompileError {
-    severity: Severity,
-    message: String,
-    root: JsSpan,
-    hints: Vec<String>,
-    trace: Vec<JsSpan>,
-}
-
-#[wasm_bindgen]
-impl CompileError {
-    fn from_diag(err: typst::diag::SourceDiagnostic, sources: HashMap<FileId, FileEntry>) -> Self {
-        let severity = err.severity;
-        let message = err.message.to_string();
-
-        let hints = err.hints.iter().map(|hint| hint.to_string()).collect();
-
-        let span = err.span;
-
-        let root = JsSpan::from_span(span, sources.clone());
-
-        let trace = err
-            .trace
-            .iter()
-            .map(|span| JsSpan::from_span(span.span, sources.clone()))
-            .collect();
-
-        Self {
-            severity,
-            message,
-            root,
-            hints,
-            trace,
-        }
-    }
-
-    pub fn get_severity(&self) -> String {
-        match self.severity {
-            Severity::Error => "error".to_string(),
-            Severity::Warning => "warning".to_string(),
-        }
-    }
-
-    pub fn get_message(&self) -> String {
-        self.message.clone()
-    }
-
-    pub fn get_hints(&self) -> Vec<String> {
-        self.hints.clone()
-    }
-
-    pub fn get_root(&self) -> JsSpan {
-        self.root.clone()
-    }
-
-    pub fn get_trace(&self) -> Vec<JsSpan> {
-        self.trace.clone()
-    }
-}
+mod js_types;
 
 #[wasm_bindgen]
 pub struct SuiteCore {
@@ -230,33 +93,6 @@ impl PartialEq for ExtendedPackageVersion {
             (Self::Latest, Self::Latest) => true,
             (Self::Version(v1), Self::Version(v2)) => v1 == v2,
             _ => false,
-        }
-    }
-}
-
-#[wasm_bindgen]
-#[derive(Clone, Debug)]
-pub struct RawPackageSpec {
-    namespace: String,
-    name: String,
-    version: String,
-    description: Option<String>,
-}
-
-#[wasm_bindgen]
-impl RawPackageSpec {
-    #[wasm_bindgen(constructor)]
-    pub fn new(
-        namespace: String,
-        name: String,
-        version: String,
-        description: Option<String>,
-    ) -> Self {
-        Self {
-            namespace,
-            name,
-            version,
-            description,
         }
     }
 }
@@ -431,184 +267,6 @@ where
 }
 
 #[wasm_bindgen]
-#[derive(Copy, Clone)]
-pub enum CompletionKindWrapper {
-    Syntax,
-    Func,
-    Type,
-    Param,
-    Constant,
-    Symbol,
-}
-
-#[wasm_bindgen]
-#[derive(Clone)]
-pub struct CompletionKindHighWrapper {
-    pub kind: CompletionKindWrapper,
-    pub detail: Option<char>,
-}
-
-impl From<CompletionKind> for CompletionKindHighWrapper {
-    fn from(kind: CompletionKind) -> Self {
-        match kind {
-            CompletionKind::Syntax => Self {
-                kind: CompletionKindWrapper::Syntax,
-                detail: None,
-            },
-            CompletionKind::Func => Self {
-                kind: CompletionKindWrapper::Func,
-                detail: None,
-            },
-            CompletionKind::Type => Self {
-                kind: CompletionKindWrapper::Type,
-                detail: None,
-            },
-            CompletionKind::Param => Self {
-                kind: CompletionKindWrapper::Param,
-                detail: None,
-            },
-            CompletionKind::Constant => Self {
-                kind: CompletionKindWrapper::Constant,
-                detail: None,
-            },
-            CompletionKind::Symbol(c) => Self {
-                kind: CompletionKindWrapper::Symbol,
-                detail: Some(c),
-            },
-        }
-    }
-}
-
-#[derive(Clone)]
-#[wasm_bindgen(js_name = Value)]
-pub struct ValueWrapper(Value);
-
-#[wasm_bindgen(js_class = Value)]
-impl ValueWrapper {
-    pub fn name(&self) -> Option<String> {
-        self.0.name().map(|s| s.to_string())
-    }
-
-    pub fn docs(&self) -> Option<String> {
-        self.0.docs().map(|s| s.to_string())
-    }
-}
-
-impl From<Value> for ValueWrapper {
-    fn from(value: Value) -> Self {
-        Self(value)
-    }
-}
-
-#[derive(Clone)]
-#[wasm_bindgen(js_name = DefinitionKind)]
-pub enum JsDefinitionKind {
-    Variable,
-    Function,
-    Module,
-    Label
-}
-
-impl From<DefinitionKind> for JsDefinitionKind {
-    fn from(kind: DefinitionKind) -> Self {
-        match kind {
-            DefinitionKind::Variable => JsDefinitionKind::Variable,
-            DefinitionKind::Function => JsDefinitionKind::Function,
-            DefinitionKind::Module => JsDefinitionKind::Module,
-            DefinitionKind::Label => JsDefinitionKind::Label,
-        }
-    }
-}
-
-#[wasm_bindgen]
-pub struct JsDefinition {
-    name: String,
-    span: JsSpan,
-    name_span: JsSpan,
-    kind: JsDefinitionKind,
-    value: Option<ValueWrapper>,
-}
-
-impl JsDefinition {
-    fn new(definition: Definition, source: &Source) -> Self {
-        let name = definition.name.to_string();
-        let span = JsSpan::from_span_single(definition.span, source);
-        let name_span = JsSpan::from_span_single(definition.name_span, source);
-        let kind = JsDefinitionKind::from(definition.kind);
-        let value = definition.value.map(ValueWrapper::from);
-
-        Self {
-            name,
-            span,
-            name_span,
-            kind,
-            value,
-        }
-    }
-}
-
-#[wasm_bindgen]
-impl JsDefinition {
-    pub fn name(&self) -> String {
-        self.name.clone()
-    }
-
-    pub fn span(&self) -> JsSpan {
-        self.span.clone()
-    }
-
-    pub fn name_span(&self) -> JsSpan {
-        self.name_span.clone()
-    }
-
-    pub fn kind(&self) -> JsDefinitionKind {
-        self.kind.clone()
-    }
-
-    pub fn value(&self) -> Option<ValueWrapper> {
-        self.value.clone()
-    }
-}
-
-#[wasm_bindgen]
-pub struct CompletionWrapper {
-    kind: CompletionKindHighWrapper,
-    label: String,
-    apply: Option<String>,
-    detail: Option<String>,
-}
-
-impl From<Completion> for CompletionWrapper {
-    fn from(completion: Completion) -> Self {
-        Self {
-            kind: completion.kind.into(),
-            label: completion.label.to_string(),
-            apply: completion.apply.map(|es| es.to_string()),
-            detail: completion.detail.map(|es| es.to_string()),
-        }
-    }
-}
-
-#[wasm_bindgen]
-impl CompletionWrapper {
-    pub fn kind(&self) -> CompletionKindHighWrapper {
-        self.kind.clone()
-    }
-
-    pub fn label(&self) -> String {
-        self.label.clone()
-    }
-
-    pub fn apply(&self) -> Option<String> {
-        self.apply.clone()
-    }
-
-    pub fn detail(&self) -> Option<String> {
-        self.detail.clone()
-    }
-}
-
-#[wasm_bindgen]
 extern "C" {
     pub fn xml_get_sync(path: String) -> Vec<u8>;
 
@@ -695,7 +353,7 @@ impl SuiteCore {
         &self,
         file: String,
         offset: usize,
-    ) -> Result<Vec<CompletionWrapper>, JsValue> {
+    ) -> Result<Vec<js_types::Completion>, JsValue> {
         let source = self
             .source(FileId::new(None, VirtualPath::new(&file)))
             .map_err(|e| JsValue::from_str(&format!("{:?}", e)))?;
@@ -708,14 +366,14 @@ impl SuiteCore {
         }
     }
 
-    pub fn definition(&self, file: String, offset: usize) -> Result<Option<JsDefinition>, JsValue> {
+    pub fn definition(&self, file: String, offset: usize) -> Result<Option<js_types::Definition>, JsValue> {
         let source = self
             .source(FileId::new(None, VirtualPath::new(&file)))
             .map_err(|e| JsValue::from_str(&format!("{:?}", e)))?;
 
         let doc = self.last_doc.lock().unwrap().clone();
 
-        Ok(typst_ide::definition(self, doc.as_ref(), &source, offset, typst::syntax::Side::After).map(|def| JsDefinition::new(def, &source)))
+        Ok(typst_ide::definition(self, doc.as_ref(), &source, offset, typst::syntax::Side::After).map(|def| js_types::Definition::new(def, &source)))
     }
 
     fn compile_str(&mut self, text: String) -> Result<String, JsValue> {
@@ -751,7 +409,7 @@ impl SuiteCore {
         }
     }
 
-    pub fn compile(&mut self, single: bool) -> Result<Vec<String>, Vec<CompileError>> {
+    pub fn compile(&mut self, single: bool) -> Result<Vec<String>, Vec<js_types::Diagnostics>> {
         match typst::compile(self).output {
             Ok(doc) => {
                 *self.last_doc.lock().unwrap() = Some(doc.clone());
@@ -762,10 +420,10 @@ impl SuiteCore {
                 }
             }
             Err(err) => {
-                let mut errs: Vec<CompileError> = Vec::new();
+                let mut errs: Vec<js_types::Diagnostics> = Vec::new();
 
                 for diag in err {
-                    errs.push(CompileError::from_diag(
+                    errs.push(js_types::Diagnostics::from_diag(
                         diag,
                         self.sources.read().unwrap().clone(),
                     ));
