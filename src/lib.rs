@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock, RwLock},
 };
 
-use chrono::{DateTime, Datelike, Local};
+use chrono::{format, DateTime, Datelike, Local};
 use file_entry::FileEntry;
 use flate2::read::GzDecoder;
 use js_types::RawPackageSpec;
@@ -25,7 +25,7 @@ use typst::{
     utils::LazyHash,
     Library, World,
 };
-use typst_ide::analyze_import;
+use typst_ide::{analyze_import, tooltip};
 use wasm_bindgen::prelude::*;
 
 mod fetch;
@@ -372,6 +372,12 @@ impl SuiteCore {
             .map_err(|e| JsValue::from_str(&format!("{:?}", e)))?;
 
         let doc = self.last_doc.lock().unwrap().clone();
+
+        logWasm(
+            format!(
+                "Tooltip: {:?}", tooltip(self, doc.as_ref(), &source, offset, typst::syntax::Side::After)
+            ).as_str()
+        );
 
         Ok(typst_ide::definition(self, doc.as_ref(), &source, offset, typst::syntax::Side::After).map(|def| js_types::Definition::new(def, &source)))
     }
