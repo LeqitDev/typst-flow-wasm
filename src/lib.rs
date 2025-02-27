@@ -325,6 +325,13 @@ impl SuiteCore {
             .collect()
     }
 
+    pub fn delete_file(&mut self, file: String) -> Result<(), JsValue> {
+        let id = FileId::new(None, VirtualPath::new(&file));
+        self.sources.write().unwrap().remove(&id);
+
+        Ok(())
+    }
+
     pub fn set_root(&mut self, root: String) -> Result<(), String> {
         // test for valid path (path in sources)
         if !self
@@ -332,7 +339,7 @@ impl SuiteCore {
             .read()
             .unwrap()
             .keys()
-            .any(|id| id.vpath().as_rootless_path().to_str().unwrap() == root.as_str())
+            .any(|id| id.vpath().as_rooted_path().to_str().unwrap() == root.as_str())
         {
             return Err("The provided root path is not valid.".to_string());
         }
@@ -366,20 +373,35 @@ impl SuiteCore {
         }
     }
 
-    pub fn definition(&self, file: String, offset: usize) -> Result<Option<js_types::Definition>, JsValue> {
+    pub fn definition(
+        &self,
+        file: String,
+        offset: usize,
+    ) -> Result<js_types::HoverProvider, JsValue> {
         let source = self
             .source(FileId::new(None, VirtualPath::new(&file)))
             .map_err(|e| JsValue::from_str(&format!("{:?}", e)))?;
 
         let doc = self.last_doc.lock().unwrap().clone();
 
-        logWasm(
-            format!(
-                "Tooltip: {:?}", tooltip(self, doc.as_ref(), &source, offset, typst::syntax::Side::After)
-            ).as_str()
-        );
+        let def = typst_ide::definition(
+            self,
+            doc.as_ref(),
+            &source,
+            offset,
+            typst::syntax::Side::After,
+        )
+        .map(|def| js_types::Definition::new(def, &source));
+        let tt = tooltip(
+            self,
+            doc.as_ref(),
+            &source,
+            offset,
+            typst::syntax::Side::After,
+        )
+        .map(js_types::Tooltip::new);
 
-        Ok(typst_ide::definition(self, doc.as_ref(), &source, offset, typst::syntax::Side::After).map(|def| js_types::Definition::new(def, &source)))
+        Ok(js_types::HoverProvider::new(def, tt))
     }
 
     fn compile_str(&mut self, text: String) -> Result<String, JsValue> {
@@ -474,6 +496,14 @@ impl SuiteCore {
         );
         log(format!("imports: {:#?}", res).as_str());
         Ok(())
+    }
+
+    pub fn get_ast(&self) -> Result<js_types::AstNode, JsValue> {
+        let main_source = self
+            .source(self.main())
+            .map_err(|e| JsValue::from_str(&format!("{:?}", e)))?;
+
+        Ok(js_types::AstNode::from_source(main_source))
     }
 
     pub fn edit(

@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
+use chrono::offset;
 use serde::Serialize;
-use typst::syntax::{FileId, Source, Span};
+use typst::syntax::{FileId, LinkedNode, Source, Span};
 use wasm_bindgen::{prelude::wasm_bindgen, JsValue};
 
 use crate::file_entry::FileEntry;
@@ -42,8 +43,14 @@ impl ResolvedSpan {
 
             Self {
                 span: format!("{:?}", span),
-                file_path: source.id().vpath().as_rooted_path().to_str().unwrap().to_string(),
-                start_offset: range.start, 
+                file_path: source
+                    .id()
+                    .vpath()
+                    .as_rooted_path()
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+                start_offset: range.start,
                 end_offset: range.end,
             }
         }
@@ -77,15 +84,14 @@ impl ResolvedSpan {
                     .to_str()
                     .unwrap()
                     .to_string(),
-                start_offset: range.start, 
+                start_offset: range.start,
                 end_offset: range.end,
             }
         }
     }
 }
 
-
-/* 
+/*
  * Diagnostics
  */
 
@@ -123,7 +129,10 @@ impl Diagnostics {
 }
 
 impl Diagnostics {
-    pub fn from_diag(err: typst::diag::SourceDiagnostic, sources: HashMap<FileId, FileEntry>) -> Self {
+    pub fn from_diag(
+        err: typst::diag::SourceDiagnostic,
+        sources: HashMap<FileId, FileEntry>,
+    ) -> Self {
         let severity = Severity::from(err.severity);
         let message = err.message.to_string();
 
@@ -149,8 +158,7 @@ impl Diagnostics {
     }
 }
 
-
-/* 
+/*
  * Completion
  */
 
@@ -230,8 +238,7 @@ impl From<typst_ide::Completion> for Completion {
     }
 }
 
-
-/* 
+/*
  * Definition
  */
 
@@ -274,7 +281,7 @@ impl From<typst_ide::DefinitionKind> for DefinitionKind {
 }
 
 #[wasm_bindgen(getter_with_clone)]
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct Definition {
     pub name: String,
     pub span: ResolvedSpan,
@@ -308,7 +315,59 @@ impl Definition {
     }
 }
 
-/* 
+#[wasm_bindgen(getter_with_clone)]
+#[derive(Serialize, Clone)]
+pub struct Tooltip {
+    pub code: Option<String>,
+    pub text: Option<String>,
+}
+
+#[wasm_bindgen]
+impl Tooltip {
+    pub fn to_json(&self) -> JsValue {
+        serde_wasm_bindgen::to_value(self).unwrap()
+    }
+}
+
+impl Tooltip {
+    pub fn new(tooltip: typst_ide::Tooltip) -> Self {
+        match tooltip {
+            typst_ide::Tooltip::Code(code) => Self {
+                code: Some(code.to_string()),
+                text: None,
+            },
+            typst_ide::Tooltip::Text(text) => Self {
+                code: None,
+                text: Some(text.to_string()),
+            },
+        }
+    }
+}
+
+#[wasm_bindgen(getter_with_clone)]
+#[derive(Serialize)]
+pub struct HoverProvider {
+    pub definition: Option<Definition>,
+    pub tooltip: Option<Tooltip>,
+}
+
+#[wasm_bindgen]
+impl HoverProvider {
+    pub fn to_json(&self) -> JsValue {
+        serde_wasm_bindgen::to_value(self).unwrap()
+    }
+}
+
+impl HoverProvider {
+    pub fn new(definition: Option<Definition>, tooltip: Option<Tooltip>) -> Self {
+        Self {
+            definition,
+            tooltip,
+        }
+    }
+}
+
+/*
  * Package Spec
  */
 
@@ -343,3 +402,43 @@ impl RawPackageSpec {
     }
 }
 
+#[wasm_bindgen(getter_with_clone)]
+#[derive(Clone, Serialize)]
+pub struct AstNode {
+    pub raw: String,
+    pub children: Vec<AstNode>,
+    pub index: usize,
+    pub offset: usize,
+}
+
+impl AstNode {
+    pub fn from_node(node: LinkedNode) -> Self {
+        let offset = node.offset();
+        let index = node.index();
+        let raw = node.text().to_string();
+        let children = node
+            .children()
+            .map(|child| Self::from_node(child.clone()))
+            .collect();
+
+        Self {
+            raw,
+            children,
+            index,
+            offset,
+        }
+    }
+
+    pub fn from_source(source: Source) -> Self {
+        let raw_root = source.root();
+
+        Self::from_node(LinkedNode::new(raw_root))
+    }
+}
+
+#[wasm_bindgen]
+impl AstNode {
+    pub fn to_json(&self) -> JsValue {
+        serde_wasm_bindgen::to_value(self).unwrap()
+    }
+}
