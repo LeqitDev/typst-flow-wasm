@@ -6,11 +6,13 @@ use std::{
     sync::{Arc, Mutex, OnceLock, RwLock},
 };
 
+use ast::{get_args, get_prev, get_prev_kind};
 use chrono::{format, DateTime, Datelike, Local};
 use file_entry::FileEntry;
 use flate2::read::GzDecoder;
 use js_types::RawPackageSpec;
 use tar::Archive;
+use tidy::parse_doc_str;
 // use parking_lot::RwLock;
 use typst::{
     diag::{EcoString, FileResult},
@@ -19,7 +21,7 @@ use typst::{
     model::Document,
     syntax::{
         package::{PackageSpec, PackageVersion},
-        FileId, LinkedNode, Source, VirtualPath,
+        FileId, LinkedNode, Source, SyntaxNode, VirtualPath,
     },
     text::{Font, FontBook},
     utils::LazyHash,
@@ -28,9 +30,11 @@ use typst::{
 use typst_ide::{analyze_import, tooltip};
 use wasm_bindgen::prelude::*;
 
+mod ast;
 mod fetch;
 mod file_entry;
 mod js_types;
+mod tidy;
 
 #[wasm_bindgen]
 pub struct SuiteCore {
@@ -384,14 +388,49 @@ impl SuiteCore {
 
         let doc = self.last_doc.lock().unwrap().clone();
 
-        let def = typst_ide::definition(
+        let raw_def = typst_ide::definition(
             self,
             doc.as_ref(),
             &source,
             offset,
             typst::syntax::Side::After,
-        )
-        .map(|def| js_types::Definition::new(def, &source));
+        );
+
+        let def = raw_def
+            .clone()
+            .map(|def| js_types::Definition::new(def, self.sources.read().unwrap().clone()));
+
+        /* if raw_def.is_some() {
+            let def = raw_def.unwrap();
+            if def.kind == typst_ide::DefinitionKind::Function
+                || def.kind == typst_ide::DefinitionKind::Variable
+            {
+                let target = def.name_span;
+
+                if !target.is_detached() {
+                    let file_id = target.id().expect("None detached span should have an id");
+
+                    let sources = self.sources.read().unwrap();
+
+                    let entry = sources
+                        .get(&file_id)
+                        .expect("File should exist because it got compiled");
+
+                    let source = entry.source();
+
+                    let node = source.find(target).unwrap().parent().unwrap().clone();
+                    logWasm(&format!(
+                        "node: {:?}, {:?}, {:?}",
+                        node.kind(),
+                        node.index(),
+                        node.offset()
+                    ));
+                    let doc = parse_doc_str(def.name.to_string(), collect_tidy_doc(node));
+                    log(format!("text: {:?}", doc.to_json()).as_str());
+                }
+            }
+        } */
+
         let tt = tooltip(
             self,
             doc.as_ref(),
@@ -498,9 +537,12 @@ impl SuiteCore {
         Ok(())
     }
 
-    pub fn get_ast(&self) -> Result<js_types::AstNode, JsValue> {
+    pub fn get_ast(&self, mut path: String) -> Result<js_types::AstNode, JsValue> {
+        if path.is_empty() {
+            path = "/main.typ".to_string();
+        }
         let main_source = self
-            .source(self.main())
+            .source(FileId::new(None, VirtualPath::new(&path)))
             .map_err(|e| JsValue::from_str(&format!("{:?}", e)))?;
 
         Ok(js_types::AstNode::from_source(main_source))

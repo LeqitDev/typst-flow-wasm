@@ -2,10 +2,14 @@ use std::collections::HashMap;
 
 use chrono::offset;
 use serde::Serialize;
-use typst::syntax::{FileId, LinkedNode, Source, Span};
+use typst::syntax::{FileId, LinkedNode, Source, Span, SyntaxKind};
 use wasm_bindgen::{prelude::wasm_bindgen, JsValue};
 
-use crate::file_entry::FileEntry;
+use crate::{
+    file_entry::FileEntry,
+    logWasm,
+    tidy::{collect_tidy_doc, parse_doc_str},
+};
 
 #[macro_export]
 macro_rules! define_lowercase_enum {
@@ -39,7 +43,7 @@ impl ResolvedSpan {
         } else {
             let range = source
                 .range(span)
-                .expect("Range should be valid because the span points to the file");
+                .expect("Range should point to the source file. Looks like it does not.");
 
             Self {
                 span: format!("{:?}", span),
@@ -56,7 +60,7 @@ impl ResolvedSpan {
         }
     }
 
-    pub fn from_sources(span: Span, sources: HashMap<FileId, FileEntry>) -> Self {
+    pub fn from_sources(span: Span, sources: &HashMap<FileId, FileEntry>) -> Self {
         if span.is_detached() {
             Self {
                 span: format!("{:?}", span),
@@ -71,8 +75,9 @@ impl ResolvedSpan {
                 .get(&file_id)
                 .expect("File should exist because it got compiled");
 
-            let range = entry
-                .source
+            let source = entry.source();
+
+            let range = source
                 .range(span)
                 .expect("Range should be valid because the span points to the file");
 
@@ -140,12 +145,12 @@ impl Diagnostics {
 
         let span = err.span;
 
-        let root = ResolvedSpan::from_sources(span, sources.clone());
+        let root = ResolvedSpan::from_sources(span, &sources);
 
         let trace = err
             .trace
             .iter()
-            .map(|span| ResolvedSpan::from_sources(span.span, sources.clone()))
+            .map(|span| ResolvedSpan::from_sources(span.span, &sources))
             .collect();
 
         Self {
@@ -298,12 +303,42 @@ impl Definition {
 }
 
 impl Definition {
-    pub fn new(definition: typst_ide::Definition, source: &Source) -> Self {
+    pub fn new(definition: typst_ide::Definition, sources: HashMap<FileId, FileEntry>) -> Self {
         let name = definition.name.to_string();
-        let span = ResolvedSpan::from_source(definition.span, source);
-        let name_span = ResolvedSpan::from_source(definition.name_span, source);
-        let kind = DefinitionKind::from(definition.kind);
-        let value = definition.value.map(Value::from);
+        let span = ResolvedSpan::from_sources(definition.span, &sources);
+        let name_span = ResolvedSpan::from_sources(definition.name_span, &sources);
+        let kind = DefinitionKind::from(definition.kind.clone());
+        let mut value = definition.value.map(Value::from);
+
+        if (value.is_none() || value.as_ref().unwrap().docs.is_none())
+            && (definition.kind == typst_ide::DefinitionKind::Function
+                || definition.kind == typst_ide::DefinitionKind::Variable)
+        {
+            let target = definition.name_span;
+
+            if !target.is_detached() {
+                let file_id = target.id().expect("None detached span should have an id");
+
+                let entry = sources
+                    .get(&file_id)
+                    .expect("File should exist because it got compiled");
+
+                let source = entry.source();
+
+                let node = source.find(target).unwrap().parent().unwrap().clone();
+                let collected = collect_tidy_doc(node);
+
+                logWasm(&format!("Collected: {:?}", collected));
+
+                value = Some(Value {
+                    name: Some(name.clone()),
+                    display: name.clone(),
+                    docs: Some(
+                        parse_doc_str(definition.name.to_string(), collected).to_doc_string(),
+                    ),
+                });
+            }
+        }
 
         Self {
             name,
@@ -409,6 +444,7 @@ pub struct AstNode {
     pub children: Vec<AstNode>,
     pub index: usize,
     pub offset: usize,
+    pub kind: String,
 }
 
 impl AstNode {
@@ -420,12 +456,14 @@ impl AstNode {
             .children()
             .map(|child| Self::from_node(child.clone()))
             .collect();
+        let kind = node.kind().name().to_string();
 
         Self {
             raw,
             children,
             index,
             offset,
+            kind,
         }
     }
 
@@ -438,6 +476,220 @@ impl AstNode {
 
 #[wasm_bindgen]
 impl AstNode {
+    pub fn to_json(&self) -> JsValue {
+        serde_wasm_bindgen::to_value(self).unwrap()
+    }
+}
+
+/*
+ * Tidy Docs
+ */
+
+#[wasm_bindgen]
+#[derive(Clone, Serialize, Debug)]
+pub enum TidyType {
+    Function,
+    Variable,
+}
+
+#[derive(Clone, Serialize, Debug)]
+pub struct TidyComments {
+    pub pre: String,     // Comments before the function/variable
+    pub type_: TidyType, // The type of the function/variable
+    pub args: Vec<(String, String, Option<String>)>, // Comments before the arguments of th function
+}
+
+impl TidyComments {
+    pub fn new(pre: String) -> Self {
+        Self {
+            pre,
+            type_: TidyType::Function,
+            args: Vec::new(),
+        }
+    }
+
+    pub fn add_arg(&mut self, arg: String, doc: String, default: Option<String>) {
+        self.args.push((arg, doc, default));
+    }
+
+    pub fn set_type(&mut self, type_: TidyType) {
+        self.type_ = type_;
+    }
+
+    pub fn has_args(&self) -> bool {
+        !self.args.is_empty()
+    }
+}
+
+#[wasm_bindgen(getter_with_clone)]
+#[derive(Clone, Serialize)]
+pub struct TidyDocs {
+    pub name: String,
+    pub type_: TidyType,
+    pub description: Option<String>,
+    pub return_types: Vec<String>,
+    pub arguments: Vec<TidyArgDocs>,
+}
+
+impl TidyDocs {
+    pub fn new(name: String, type_: TidyType) -> Self {
+        Self {
+            name,
+            type_,
+            description: None,
+            return_types: Vec::new(),
+            arguments: Vec::new(),
+        }
+    }
+
+    pub fn add_description(&mut self, description: String) {
+        self.description = Some(description);
+    }
+
+    pub fn add_return_type(&mut self, return_type: String) {
+        self.return_types.push(return_type);
+    }
+
+    pub fn add_argument(&mut self, arg: TidyArgDocs) {
+        self.arguments.push(arg);
+    }
+
+    pub fn to_doc_string(&self) -> String {
+        let mut result = String::new();
+
+        fn format_types(types: &[String], join: &str) -> String {
+            types
+                .iter()
+                .map(|t| format!("<div data-code=\"type\">{}</div>", t))
+                .collect::<Vec<String>>()
+                .join(join)
+        }
+
+        result.push_str("<div data-code=\"desc\">");
+        if let Some(description) = &self.description {
+            result.push_str(&format!(
+                "<div data-code=\"text\">{}</div>",
+                description.replace("\n", "")
+            ));
+        }
+
+        if !self.arguments.is_empty() {
+            result.push_str("<div data-code=\"h1\">Parameters</div>");
+            let mut arg_str = String::new();
+            for (i, arg) in self.arguments.iter().enumerate() {
+                let types = if arg.types.is_empty() {
+                    "".to_string()
+                } else {
+                    format!(": {}", format_types(&arg.types, " "))
+                };
+                arg_str.push_str(&format!(
+                    "<div data-code=\"function-arg\">{}{}{}{}</div>",
+                    arg.name,
+                    if arg.default.is_some() { "?" } else { "" },
+                    types,
+                    if i < self.arguments.len() - 1 {
+                        ", "
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            let return_types = if self.return_types.is_empty() {
+                "".to_string()
+            } else {
+                format!(" -> {}", format_types(&self.return_types, " "))
+            };
+
+            result.push_str(&format!(
+                "<div data-code=\"function\"><div data-code=\"name\">{}</div>({}){}</div>",
+                self.name,
+                arg_str.trim_end_matches(", "),
+                return_types
+            ));
+
+            for arg in &self.arguments {
+                result.push_str("<div data-code=\"arg\">");
+                result.push_str(&format!(
+                    "<div data-code=\"arg-heading\"><div data-code=\"arg-name\">{}</div> {}</div>",
+                    arg.name,
+                    format_types(&arg.types, " <div data-code=\"or\">or</div> ")
+                ));
+                if let Some(description) = &arg.description {
+                    result.push_str(&format!(
+                        "<div data-code=\"arg-content\">{}</div><div data-code=\"arg-default\">{}</div>",
+                        description,
+                        if arg.default.is_some() {
+                            format!("Default: {}", arg.default.as_ref().unwrap())
+                        } else {
+                            "".to_string()
+                        }
+                    ));
+                }
+                result.push_str("</div>");
+            }
+        } else {
+            let return_types = if self.return_types.is_empty() {
+                "".to_string()
+            } else {
+                format!(" -> {}", format_types(&self.return_types, " "))
+            };
+            result.push_str(&format!(
+                "<div data-code=\"function\"><div data-code=\"name\">{}</div>{}{}</div>",
+                self.name,
+                match self.type_ {
+                    TidyType::Function => "()",
+                    TidyType::Variable => "",
+                },
+                return_types
+            ));
+        }
+        result.push_str("</>");
+
+        result
+    }
+}
+
+#[wasm_bindgen]
+impl TidyDocs {
+    pub fn to_json(&self) -> JsValue {
+        serde_wasm_bindgen::to_value(self).unwrap()
+    }
+}
+
+#[wasm_bindgen(getter_with_clone)]
+#[derive(Clone, Serialize)]
+pub struct TidyArgDocs {
+    pub name: String,
+    pub types: Vec<String>,
+    pub description: Option<String>,
+    pub default: Option<String>,
+}
+
+impl TidyArgDocs {
+    pub fn new(name: String) -> Self {
+        Self {
+            name,
+            types: Vec::new(),
+            description: None,
+            default: None,
+        }
+    }
+
+    pub fn add_type(&mut self, type_: String) {
+        self.types.push(type_);
+    }
+
+    pub fn add_description(&mut self, description: String) {
+        self.description = Some(description);
+    }
+
+    pub fn add_default(&mut self, default: String) {
+        self.default = Some(default);
+    }
+}
+
+#[wasm_bindgen]
+impl TidyArgDocs {
     pub fn to_json(&self) -> JsValue {
         serde_wasm_bindgen::to_value(self).unwrap()
     }
