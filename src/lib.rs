@@ -502,6 +502,7 @@ impl SuiteCore {
     }
 
     pub fn add_file(&mut self, file: String, text: String) -> Result<(), JsValue> {
+        logWasm(format!("adding file: {:?}", file).as_str());
         let id = FileId::new(None, VirtualPath::new(&file));
         self.sources
             .write()
